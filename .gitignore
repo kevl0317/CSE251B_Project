@@ -2,3 +2,5 @@
 *.sh
 *.vscode
 *.claude
+*.npy
+*.bin
