@@ -1,0 +1,14 @@
+--- Evaluating local model: ../nanoGPT/out/dropout_base/ ---
+Loading model from ../nanoGPT/out/dropout_base/checkpoint.pt...
+number of parameters: 50.93M
+Total parameters:       51,454,464
+Trainable parameters:   51,454,464
+Evaluating on val.bin (block_size=1024)...
+
+==================================================
+  Perplexity:          43.9906
+  Avg loss (nats):     3.783976
+  Tokens evaluated:    5,169,152
+  Total parameters:    51,454,464
+  Eval time:           20.5s
+==================================================

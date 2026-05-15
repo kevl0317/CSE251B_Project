@@ -1,0 +1,9 @@
+python train.py \
+  --dataset=fineweb \
+  --n_layer=8 --n_head=8 --n_embd=512 \
+  --batch_size=12 --gradient_accumulation_steps=8 --block_size=1024 \
+  --max_iters=10000 --lr_decay_iters=10000 --warmup_iters=200 \
+  --learning_rate=6e-4 --min_lr=6e-5 \
+  --eval_interval=500 --eval_iters=100 \
+  --device=cuda --dtype=bfloat16 --compile=True \
+  --out_dir=out-baseline

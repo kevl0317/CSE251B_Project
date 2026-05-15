@@ -1,0 +1,14 @@
+--- Evaluating local model: . ---
+Loading model from ./baseline-day3.pt...
+number of parameters: 50.93M
+Total parameters:       51,454,464
+Trainable parameters:   51,454,464
+Evaluating on contest/val.bin (block_size=1024)...
+
+==================================================
+  Perplexity:          41.7168
+  Avg loss (nats):     3.730905
+  Tokens evaluated:    5,169,152
+  Total parameters:    51,454,464
+  Eval time:           27.4s
+==================================================

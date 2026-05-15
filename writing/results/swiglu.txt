@@ -1,0 +1,14 @@
+--- Evaluating local model: . ---
+Loading model from ./swiglu.pt...
+number of parameters: 51.06M
+Total parameters:       51,585,536
+Trainable parameters:   51,585,536
+Evaluating on contest/val.bin (block_size=1024)...
+
+==================================================
+  Perplexity:          41.1999
+  Avg loss (nats):     3.718436
+  Tokens evaluated:    5,169,152
+  Total parameters:    51,585,536
+  Eval time:           29.9s
+==================================================
