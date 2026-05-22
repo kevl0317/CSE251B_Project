@@ -1,0 +1,14 @@
+--- Evaluating local model: ../nanoGPT/out/out-wsd/ ---
+Loading model from ../nanoGPT/out/out-wsd/checkpoint.pt...
+number of parameters: 50.93M
+Total parameters:       51,454,464
+Trainable parameters:   51,454,464
+Evaluating on val.bin (block_size=1024)...
+
+==================================================
+  Perplexity:          39.4589
+  Avg loss (nats):     3.675260
+  Tokens evaluated:    5,169,152
+  Total parameters:    51,454,464
+  Eval time:           37.4s
+==================================================
