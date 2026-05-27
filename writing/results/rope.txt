@@ -1,0 +1,14 @@
+--- Evaluating local model: ../nanoGPT/out/out_rope ---
+Loading model from ../nanoGPT/out/out_rope/checkpoint.pt...
+number of parameters: 65.04M
+Total parameters:       98,849,184
+Trainable parameters:   98,849,184
+Evaluating on val.bin (block_size=1024)...
+
+==================================================
+  Perplexity:          32.0485
+  Avg loss (nats):     3.467251
+  Tokens evaluated:    5,169,152
+  Total parameters:    98,849,184
+  Eval time:           31.9s
+==================================================
