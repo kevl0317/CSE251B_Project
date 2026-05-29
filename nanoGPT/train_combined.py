@@ -1,6 +1,8 @@
 """
-Train a GPT model combining RMSNorm + RoPE + Muon with a WSD LR schedule.
-Short stable phase ("low stable iterations") → most of training is decay.
+Train a GPT model combining RMSNorm + RoPE + (optional SwiGLU) with a WSD LR
+schedule. Optimizer is either single-Muon (default) or a hybrid Muon+AdamW split
+(hybrid_opt=True). WSD: warmup -> stable plateau at peak -> cosine decay to
+min_lr_frac * peak (0.0 = decay to zero).
 """
 
 import os
@@ -38,18 +40,28 @@ n_head = 8
 n_embd = 512
 dropout = 0.0
 bias = False
-# Muon optimizer (lower lr than the default 0.02 — avoids weight explosion)
-learning_rate = 0.003
+use_swiglu = False            # replace GELU MLP with param-matched SwiGLU
+mlp_hidden_dim = 0            # SwiGLU hidden dim; 0 = auto (~8/3 * n_embd)
+# Optimizer
+#   Single-Muon (default): all params -> Muon at `learning_rate`.
+#   Hybrid (hybrid_opt=True): Muon over block matrices at `muon_lr`; AdamW over
+#   the (tied) embedding/LM head + RMSNorm gains at `adamw_lr`.
+learning_rate = 0.003        # used only when hybrid_opt=False
+hybrid_opt = False
+muon_lr = 0.02               # Muon LR for block matrices (hybrid only)
+adamw_lr = 2e-3              # AdamW LR for embeddings/head + norms (hybrid only)
 max_iters = 10000
 weight_decay = 0.01
 momentum = 0.95
 grad_clip = 1.0
-# WSD schedule with short stable phase
+# WSD schedule: warmup -> stable plateau at peak -> cosine decay to min_lr_frac*peak.
+# Applied as a *multiplier* on each param group's base LR, so it works for both the
+# single-Muon and hybrid (two base LRs) optimizers.
 decay_lr = True
-warmup_iters = 500            # 5% linear warmup
-wsd_stable_iters = 1500        # stable plateau: 500→1500 (1000 steps, 10%)
-wsd_decay_iters = None         # computed automatically: 8500 steps of decay (85%)
-min_lr = 0.0003               # 10% of peak LR
+warmup_iters = 500            # linear warmup
+wsd_stable_iters = 8000       # end of stable plateau (MUST be > warmup_iters)
+wsd_decay_iters = None        # computed automatically: max_iters - wsd_stable_iters
+min_lr_frac = 0.0             # decay endpoint as a fraction of peak LR (0.0 = decay to zero)
 # DDP
 backend = 'nccl'
 device = 'cuda'
@@ -63,10 +75,14 @@ config = {k: globals()[k] for k in config_keys}
 # Compute decay iters from remaining steps (can be overridden via CLI)
 if wsd_decay_iters is None:
     wsd_decay_iters = max_iters - wsd_stable_iters
-assert warmup_iters + (wsd_stable_iters - warmup_iters) + wsd_decay_iters == max_iters, \
-    f"warmup({warmup_iters}) + stable({wsd_stable_iters - warmup_iters}) + decay({wsd_decay_iters}) != max_iters({max_iters})"
+assert warmup_iters < wsd_stable_iters, \
+    f"warmup_iters ({warmup_iters}) must be < wsd_stable_iters ({wsd_stable_iters}); " \
+    f"otherwise the stable plateau is empty and the schedule degenerates to warmup->decay."
+assert wsd_stable_iters + wsd_decay_iters == max_iters, \
+    f"stable_end({wsd_stable_iters}) + decay({wsd_decay_iters}) != max_iters({max_iters})"
 print(f"WSD schedule: warmup={warmup_iters}, stable_end={wsd_stable_iters}, "
-      f"decay={wsd_decay_iters} (stable steps={wsd_stable_iters - warmup_iters})")
+      f"decay={wsd_decay_iters} (stable steps={wsd_stable_iters - warmup_iters}, "
+      f"min_lr_frac={min_lr_frac})")
 # -----------------------------------------------------------------------------
 
 ddp = int(os.environ.get('RANK', -1)) != -1
@@ -124,7 +140,8 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout)
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  use_swiglu=use_swiglu, mlp_hidden_dim=mlp_hidden_dim)
 if init_from == 'scratch':
     print("Initializing a new model from scratch")
     if meta_vocab_size is None:
@@ -139,6 +156,9 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    # carry architecture flags from the checkpoint (default to current config for older ckpts)
+    for k in ['use_swiglu', 'mlp_hidden_dim']:
+        model_args[k] = checkpoint_model_args.get(k, model_args[k])
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
@@ -161,9 +181,13 @@ if block_size < model.config.block_size:
 model.to(device)
 
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (momentum, 0.0), device_type)
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (momentum, 0.0), device_type,
+                                       hybrid=hybrid_opt, muon_lr=muon_lr, adamw_lr=adamw_lr)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
+# Record each group's base LR; the WSD schedule scales these by a multiplier each step.
+for group in optimizer.param_groups:
+    group.setdefault('initial_lr', group['lr'])
 checkpoint = None
 
 if compile:
@@ -195,20 +219,21 @@ def estimate_loss():
 #   stable:       peak LR       (steps warmup_iters to wsd_stable_iters)
 #   decay:        peak → min    (steps wsd_stable_iters to max_iters, cosine)
 # -----------------------------------------------------------------------------
-def get_lr(it):
+def get_lr_mult(it):
+    """WSD multiplier in [min_lr_frac, 1.0], applied to each group's base LR."""
     if it < warmup_iters:
         # Phase 1: linear warmup
-        return learning_rate * (it + 1) / (warmup_iters + 1)
+        return (it + 1) / (warmup_iters + 1)
     elif it < wsd_stable_iters:
-        # Phase 2: constant at peak LR (short plateau)
-        return learning_rate
+        # Phase 2: constant at peak LR (stable plateau)
+        return 1.0
     else:
-        # Phase 3: cosine decay to min_lr
+        # Phase 3: cosine decay from peak down to min_lr_frac * peak
         decay_step = it - wsd_stable_iters
         if decay_step >= wsd_decay_iters:
-            return min_lr
+            return min_lr_frac
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_step / wsd_decay_iters))
-        return min_lr + coeff * (learning_rate - min_lr)
+        return min_lr_frac + coeff * (1.0 - min_lr_frac)
 # -----------------------------------------------------------------------------
 
 if wandb_log and master_process:
@@ -223,9 +248,10 @@ raw_model = model.module if ddp else model
 running_mfu = -1.0
 while True:
 
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    lr_mult = get_lr_mult(iter_num) if decay_lr else 1.0
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group['lr'] = param_group['initial_lr'] * lr_mult
+    lr = optimizer.param_groups[0]['lr']
 
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()

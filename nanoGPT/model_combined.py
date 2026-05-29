@@ -74,6 +74,38 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------------------------------------------------------
+# CombinedOptimizer: drive Muon + AdamW together (hybrid recipe)
+# -----------------------------------------------------------------------------
+
+class CombinedOptimizer:
+    """Thin wrapper that steps several sub-optimizers as one.
+
+    Exposes a concatenated `param_groups` (referencing the real group dicts) so the
+    training loop can set per-group LRs uniformly, while each group keeps its own
+    base LR via 'initial_lr'. Only the methods the training loop uses are provided.
+    """
+
+    def __init__(self, optimizers):
+        self.optimizers = list(optimizers)
+        self.param_groups = [g for opt in self.optimizers for g in opt.param_groups]
+
+    def zero_grad(self, set_to_none=True):
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self, *args, **kwargs):
+        for opt in self.optimizers:
+            opt.step()
+
+    def state_dict(self):
+        return {'combined': [opt.state_dict() for opt in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        for opt, sd in zip(self.optimizers, state_dict['combined']):
+            opt.load_state_dict(sd)
+
+
+# -----------------------------------------------------------------------------
 # RMSNorm
 # -----------------------------------------------------------------------------
 
@@ -184,6 +216,25 @@ class MLP(nn.Module):
         return x
 
 
+class SwiGLU(nn.Module):
+    # LLaMA-style SwiGLU MLP: down(silu(gate(x)) * up(x)).
+    # Hidden dim defaults to ~(8/3)*n_embd to match the vanilla MLP's 8*d^2 param
+    # budget; set config.mlp_hidden_dim explicitly to override. Down projection is
+    # named c_proj so the residual scaled-init in GPT.__init__ still applies.
+    def __init__(self, config):
+        super().__init__()
+        hidden = config.mlp_hidden_dim if config.mlp_hidden_dim else int(round(8 * config.n_embd / 3))
+        self.gate_proj = nn.Linear(config.n_embd, hidden, bias=config.bias)
+        self.up_proj   = nn.Linear(config.n_embd, hidden, bias=config.bias)
+        self.c_proj    = nn.Linear(hidden, config.n_embd, bias=config.bias)
+        self.dropout   = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        x = self.dropout(x)
+        return x
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -191,7 +242,7 @@ class Block(nn.Module):
         self.ln_1 = RMSNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLU(config) if config.use_swiglu else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -212,6 +263,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True
+    use_swiglu: bool = False   # replace GELU MLP with LLaMA-style SwiGLU
+    mlp_hidden_dim: int = 0    # SwiGLU hidden dim; 0 = auto (~8/3 * n_embd, param-matched)
 
 
 class GPT(nn.Module):
@@ -343,27 +396,55 @@ class GPT(nn.Module):
     # Muon optimizer
     # -------------------------------------------------------------------------
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type,
+                             hybrid=False, muon_lr=0.02, adamw_lr=2e-3, adamw_betas=(0.9, 0.95)):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         momentum = betas[0] if isinstance(betas, tuple) else betas
-        optim_groups = [
-            {'params': decay_params, 'lr': learning_rate, 'momentum': momentum,
-             'nesterov': True, 'ns_steps': 5, 'wd': weight_decay},
-            {'params': nodecay_params, 'lr': learning_rate, 'momentum': momentum,
-             'nesterov': True, 'ns_steps': 5, 'wd': 0.0},
-        ]
-        optimizer = Muon(optim_groups, lr=learning_rate, momentum=momentum)
-        print(f"using Muon optimizer with momentum={momentum}")
-        return optimizer
+
+        if not hybrid:
+            # Original recipe: a single Muon optimizer over every parameter.
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+            optim_groups = [
+                {'params': decay_params, 'lr': learning_rate, 'momentum': momentum,
+                 'nesterov': True, 'ns_steps': 5, 'wd': weight_decay},
+                {'params': nodecay_params, 'lr': learning_rate, 'momentum': momentum,
+                 'nesterov': True, 'ns_steps': 5, 'wd': 0.0},
+            ]
+            optimizer = Muon(optim_groups, lr=learning_rate, momentum=momentum)
+            print(f"using Muon optimizer with momentum={momentum}")
+            return optimizer
+
+        # Hybrid recipe: Muon over the transformer block matrices only; AdamW over
+        # the (tied) token embedding / LM head and all 1D params (RMSNorm gains).
+        muon_params, adamw_decay, adamw_nodecay = [], [], []
+        for n, p in param_dict.items():
+            if p.dim() < 2:
+                adamw_nodecay.append(p)                      # RMSNorm gains
+            elif 'wte' in n or 'lm_head' in n:
+                adamw_decay.append(p)                        # tied embedding / output head
+            else:
+                muon_params.append(p)                        # attn + MLP block matrices
+        n_muon = sum(p.numel() for p in muon_params)
+        n_adamw = sum(p.numel() for p in adamw_decay + adamw_nodecay)
+        print(f"hybrid optimizer: Muon over {len(muon_params)} matrices "
+              f"({n_muon:,} params, lr={muon_lr}); AdamW over "
+              f"{len(adamw_decay) + len(adamw_nodecay)} tensors ({n_adamw:,} params, lr={adamw_lr})")
+
+        muon = Muon(
+            [{'params': muon_params, 'lr': muon_lr, 'momentum': momentum,
+              'nesterov': True, 'ns_steps': 5, 'wd': weight_decay}],
+            lr=muon_lr, momentum=momentum)
+        use_fused = (device_type == 'cuda')
+        adamw = torch.optim.AdamW(
+            [{'params': adamw_decay, 'weight_decay': weight_decay},
+             {'params': adamw_nodecay, 'weight_decay': 0.0}],
+            lr=adamw_lr, betas=adamw_betas, fused=use_fused)
+        return CombinedOptimizer([muon, adamw])
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         N = self.get_num_params()
