@@ -84,43 +84,73 @@ The 1-epoch command passed `warmup_iters=2000 wsd_stable_iters=1500`. Since stab
 
 ## 5. Concrete next steps
 
-1. [ ] Edit `model_combined.py`: hybrid optimizer in `configure_optimizers`; swap MLP → SwiGLU.
-2. [ ] Edit `train_combined.py`: fix WSD `get_lr` + guard; expose separate Muon/AdamW LR args.
-3. [ ] Run small-config 10k ablation with Tier-1 fixes; target < 33.90.
-4. [ ] (optional) Add QK-norm; re-run 10k.
-5. [ ] Run big-config (98.8M) 10k validation of winning config.
+1. [x] Edit `model_combined.py`: hybrid optimizer in `configure_optimizers`; add SwiGLU. *(commit b39bd65)*
+2. [x] Edit `train_combined.py`: WSD multiplier + `warmup<stable` guard; `--use_swiglu/--hybrid_opt/--muon_lr/--adamw_lr/--min_lr_frac` flags. *(commit b39bd65)*
+3. [ ] Run small-config 10k Run A (SwiGLU + decay-to-0, single Muon); target < 33.90.
+4. [ ] Run small-config hybrid sweep (Muon LR 0.02 / 0.035 / 0.05); beat Run A.
+5. [ ] (optional) Big-config (98.8M) 10k validation of winning config.
 6. [ ] Launch final full run (1+ epoch) with winner; evaluate on val.bin; submit if < 24.20.
+7. [ ] (optional) Add QK-norm; re-run 10k.
+
+> Record actual run results in **EXPERIMENTS.md**.
+
+### New CLI flags (commit b39bd65)
+| Flag | Default | Meaning |
+|---|---|---|
+| `--use_swiglu` | False | SwiGLU MLP (param-matched, hidden≈8/3·n_embd) |
+| `--mlp_hidden_dim` | 0 | override SwiGLU hidden dim (0=auto) |
+| `--hybrid_opt` | False | Muon(block matrices) + AdamW(embed/head+norms) |
+| `--muon_lr` | 0.02 | Muon LR (hybrid only) |
+| `--adamw_lr` | 2e-3 | AdamW LR (hybrid only) |
+| `--min_lr_frac` | 0.0 | WSD decay endpoint as fraction of peak (0=zero) |
+
+**Removed:** `--min_lr` (replaced by `--min_lr_frac`). Requires `warmup_iters < wsd_stable_iters`. Keep `--dtype=bfloat16` (hybrid optimizer needs the GradScaler disabled).
 
 ### Reference commands
 
-Small-config 10k (fast iteration, self-contained WSD):
+Smoke-test on the pod before any run:
 ```bash
-python -u train_combined.py \
-  --dataset=fineweb \
-  --n_layer=8 --n_head=8 --n_embd=512 \
-  --batch_size=12 --gradient_accumulation_steps=8 --block_size=1024 \
-  --max_iters=10000 --warmup_iters=500 --wsd_stable_iters=8000 \
-  --learning_rate=0.02 --min_lr=0.0 --weight_decay=0.1 --momentum=0.95 \
-  --eval_interval=500 --eval_iters=200 \
-  --device=cuda --dtype=bfloat16 --compile=True \
-  --out_dir=out/out_combined_v2_10k
-# (LR/arg names finalize once optimizer split lands)
+cd nanoGPT && python smoke_test_combined.py
 ```
 
-Final big-config full run (after winner chosen):
+Run A — corrected baseline (SwiGLU + decay-to-0 + valid stable), single Muon:
 ```bash
-python -u train_combined.py \
-  --dataset=fineweb \
+python -u train_combined.py --dataset=fineweb \
+  --n_layer=8 --n_head=8 --n_embd=512 \
+  --batch_size=12 --gradient_accumulation_steps=8 --block_size=1024 \
+  --max_iters=10000 --warmup_iters=500 --wsd_stable_iters=8000 --min_lr_frac=0.0 \
+  --use_swiglu=True --learning_rate=0.003 --weight_decay=0.1 --momentum=0.95 \
+  --eval_interval=500 --eval_iters=200 --device=cuda --dtype=bfloat16 --compile=True \
+  --out_dir=out/combined_A_swiglu
+```
+
+Runs B/C/D — hybrid optimizer, sweep Muon LR (AdamW fixed at 2e-3):
+```bash
+for MLR in 0.02 0.035 0.05; do
+python -u train_combined.py --dataset=fineweb \
+  --n_layer=8 --n_head=8 --n_embd=512 \
+  --batch_size=12 --gradient_accumulation_steps=8 --block_size=1024 \
+  --max_iters=10000 --warmup_iters=500 --wsd_stable_iters=8000 --min_lr_frac=0.0 \
+  --use_swiglu=True --hybrid_opt=True --muon_lr=$MLR --adamw_lr=2e-3 \
+  --weight_decay=0.1 --momentum=0.95 \
+  --eval_interval=500 --eval_iters=200 --device=cuda --dtype=bfloat16 --compile=True \
+  --out_dir=out/combined_hybrid_mlr$MLR
+done
+```
+
+Final big-config full run (winner config; n_embd=672, ~98.8M):
+```bash
+python -u train_combined.py --dataset=fineweb \
   --n_layer=12 --n_head=12 --n_embd=672 \
   --batch_size=12 --gradient_accumulation_steps=8 --block_size=1024 \
-  --max_iters=100240 --warmup_iters=2000 --wsd_stable_iters=82000 \
-  --learning_rate=0.02 --min_lr=0.0 --weight_decay=0.1 --momentum=0.95 \
-  --eval_interval=500 --eval_iters=200 \
-  --device=cuda --dtype=bfloat16 --compile=True \
+  --max_iters=100240 --warmup_iters=2000 --wsd_stable_iters=82000 --min_lr_frac=0.0 \
+  --use_swiglu=True --hybrid_opt=True --muon_lr=<WINNER> --adamw_lr=2e-3 \
+  --weight_decay=0.1 --momentum=0.95 \
+  --eval_interval=500 --eval_iters=200 --device=cuda --dtype=bfloat16 --compile=True \
   --out_dir=out/out_combined_v2_1epoch
 ```
 
 Evaluate:
 ```bash
-python evaluate.py --model_dir out/out_combined_v2_1epoch --data val.bin
+python ../cse251b-nanogpt-contest-public/evaluate.py --model_dir out/out_combined_v2_1epoch --data val.bin
 ```
